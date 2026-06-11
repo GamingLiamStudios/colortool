@@ -1,257 +1,480 @@
-use std::sync::Arc;
-
-use winit::{
-    application::ApplicationHandler,
-    event::WindowEvent,
-    event_loop::{ActiveEventLoop, EventLoop},
-    window::{Window, WindowId},
+use std::{
+    fs::File,
+    num::NonZero,
+    os::fd::{
+        AsFd,
+        OwnedFd,
+    },
 };
 
-#[derive(thiserror::Error, Debug)]
+use half::f16;
+use rgb::Rgba;
+use smithay_client_toolkit::{
+    compositor::{
+        CompositorHandler,
+        CompositorState,
+    },
+    delegate_compositor,
+    delegate_dmabuf,
+    delegate_output,
+    delegate_registry,
+    delegate_xdg_shell,
+    delegate_xdg_window,
+    dmabuf::{
+        DmabufHandler,
+        DmabufState,
+    },
+    output::{
+        OutputHandler,
+        OutputState,
+    },
+    reexports::{
+        calloop::{
+            EventLoop,
+            InsertError,
+            LoopHandle,
+        },
+        calloop_wayland_source::WaylandSource,
+        client::{
+            ConnectError,
+            Connection,
+            globals::{
+                GlobalError,
+                registry_queue_init,
+            },
+        },
+    },
+    registry::{
+        ProvidesRegistryState,
+        RegistryState,
+    },
+    registry_handlers,
+    shell::{
+        WaylandSurface,
+        xdg::{
+            XdgShell,
+            window::{
+                Window,
+                WindowConfigure,
+                WindowHandler,
+            },
+        },
+    },
+};
+use tracing::Level;
+use tracing_subscriber::{
+    Layer,
+    filter::Targets,
+    layer::SubscriberExt,
+};
+use wayland_client::{
+    QueueHandle,
+    protocol::{
+        wl_buffer::WlBuffer,
+        wl_output::{
+            Transform,
+            WlOutput,
+        },
+        wl_surface::WlSurface,
+    },
+};
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::{
+    self,
+    ZwpLinuxBufferParamsV1,
+};
+
+#[derive(Debug, thiserror::Error)]
 enum Error {
-    #[error("Failed to create window surface")]
-    CreateWindowSurface(#[from] wgpu::CreateSurfaceError),
+    #[error("Failed to initalize Wayland connection")]
+    WaylandConnection(#[from] ConnectError),
 
-    #[error("Failed to request wgpu adapter")]
-    RequestAdapter(#[from] wgpu::RequestAdapterError),
+    #[error("Global Error")]
+    WaylandGlobal(#[from] GlobalError),
 
-    #[error("Failed to request wgpu device")]
-    RequestDevice(#[from] wgpu::RequestDeviceError),
+    #[error("Wayland Eventloop Error")]
+    WaylandInsert(#[from] InsertError<WaylandSource<App>>),
 
-    #[error("Surface doesn't support Float Texture Format")]
-    InvalidTextureFormat,
+    #[error("I/O Error")]
+    GenericIO(#[from] std::io::Error),
 }
 
-struct State {
-    target_color: wgpu::Color,
-
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    is_surface_configured: bool,
-    window: Arc<Window>,
-}
-
-impl State {
-    async fn new(window: Arc<Window>) -> Result<Self, Error> {
-        let size = window.inner_size();
-
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            flags: wgpu::InstanceFlags::default(),
-            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-            backend_options: wgpu::BackendOptions::default(),
-            display: None,
-        });
-        let surface = instance.create_surface(window.clone())?;
-
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await?;
-
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: None,
-                required_features: wgpu::Features::empty(),
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::default(),
-                trace: wgpu::Trace::Off,
-            })
-            .await?;
-
-        let surface_caps = surface.get_capabilities(&adapter);
-        // TODO: Don't search for SRGB only; ideally skip srgb and find max bitdepth + color passthrough(?)
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .find(|f| {
-                use wgpu::TextureFormat::*;
-                matches!(f, Rgba16Float | Rgba32Float)
-            })
-            .copied()
-            .ok_or(Error::InvalidTextureFormat)?;
-
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width: size.width,
-            height: size.height,
-            present_mode: surface_caps.present_modes[0],
-            alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-
-        Ok(Self {
-            surface,
-            device,
-            queue,
-            config,
-            is_surface_configured: false,
-            window,
-            target_color: wgpu::Color {
-                r: 0.1,
-                g: 0.2,
-                b: 0.3,
-                a: 1.0,
-            },
-        })
-    }
-
-    fn resize(
-        &mut self,
-        width: u32,
-        height: u32,
-    ) {
-        if width > 0 && height > 0 {
-            self.config.width = width;
-            self.config.height = height;
-            self.surface.configure(&self.device, &self.config);
-            self.is_surface_configured = true;
-        }
-    }
-
-    fn render(&mut self) -> Result<(), Error> {
-        self.window.request_redraw();
-        if !self.is_surface_configured {
-            return Ok(());
-        }
-
-        let output = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(surface_texture) => surface_texture,
-            wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => {
-                self.surface.configure(&self.device, &self.config);
-                surface_texture
-            },
-            wgpu::CurrentSurfaceTexture::Timeout
-            | wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Validation => {
-                return Ok(());
-            },
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.surface.configure(&self.device, &self.config);
-                return Ok(());
-            },
-            wgpu::CurrentSurfaceTexture::Lost => {
-                panic!("shit");
-            },
-        };
-
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render encoder"),
-            });
-
-        {
-            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
-            });
-        }
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
-
-        Ok(())
-    }
+struct Framebuffer {
+    gbm:      gbm::BufferObject<()>,
+    fd:       OwnedFd,
+    size:     (u32, u32),
+    params:   ZwpLinuxBufferParamsV1,
+    wayland:  Option<WlBuffer>,
+    released: bool,
 }
 
 struct App {
-    state: Option<State>,
+    registry_state: RegistryState,
+    output_state:   OutputState,
+    dmabuf_state:   DmabufState,
+
+    gbm_device:   gbm::Device<File>,
+    framebuffers: [Framebuffer; 2],
+    surface:      WlSurface,
+    window:       Window,
+
+    pub is_running: bool,
+    swatch_color:   rgb::Rgba<f16>,
+
+    loop_handle: LoopHandle<'static, Self>,
 }
 
 impl App {
-    pub fn new() -> Self {
-        Self { state: None }
+    pub fn new(loop_handle: LoopHandle<'static, App>) -> Result<Self, Error> {
+        let conn = Connection::connect_to_env()?;
+
+        let (globals, event_queue) = registry_queue_init(&conn)?;
+        let qh = event_queue.handle();
+        WaylandSource::new(conn.clone(), event_queue).insert(loop_handle.clone())?;
+
+        let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor missing");
+        let xdg_shell = XdgShell::bind(&globals, &qh).expect("xdg_shell missing");
+        let dmabuf_state = DmabufState::new(&globals, &qh);
+
+        let surface = compositor.create_surface(&qh);
+        let window = xdg_shell.create_window(
+            surface.clone(),
+            smithay_client_toolkit::shell::xdg::window::WindowDecorations::None,
+            &qh,
+        );
+
+        window.set_title("colortool");
+        window.set_app_id("org.glstudios.colortool");
+        window.set_min_size(Some((256, 256)));
+        window.commit();
+
+        surface.frame(&qh, surface.clone());
+        surface.commit();
+
+        let card = File::options()
+            .write(true)
+            .read(true)
+            .open("/dev/dri/renderD128")?;
+        let gbm_device = gbm::Device::new(card)?;
+
+        Ok(Self {
+            registry_state: RegistryState::new(&globals),
+            output_state: OutputState::new(&globals, &qh),
+
+            framebuffers: std::array::from_fn(|i| {
+                let buffer = gbm_device
+                    .create_buffer_object(
+                        256,
+                        256,
+                        gbm::Format::Abgr16161616f,
+                        gbm::BufferObjectFlags::LINEAR | gbm::BufferObjectFlags::RENDERING,
+                    )
+                    .expect("failed to create framebuffer");
+
+                let stride = size_of::<Rgba<f16>>() as u32 * 256;
+                let fd = buffer.fd().expect("failed to get framebuffer fd");
+
+                let params = dmabuf_state
+                    .create_params(&qh)
+                    .expect("Failed to create dmabuf");
+                params.add(fd.as_fd(), 0, 0, stride, 0);
+
+                Framebuffer {
+                    fd,
+                    gbm: buffer,
+                    size: (256, 256),
+                    wayland: None,
+                    params: params.create(
+                        256 as i32,
+                        256 as i32,
+                        0x48344241, // ABGR f16
+                        zwp_linux_buffer_params_v1::Flags::empty(),
+                    ),
+                    released: true,
+                }
+            }),
+            dmabuf_state,
+            swatch_color: Rgba::new(
+                f16::from_f32(2.0),
+                f16::from_f32(2.0),
+                f16::from_f32(2.0),
+                f16::from_f32(1.0),
+            ),
+
+            surface,
+            window,
+            gbm_device,
+
+            loop_handle,
+            is_running: false,
+        })
     }
 }
 
-impl ApplicationHandler<State> for App {
-    fn resumed(
+impl CompositorHandler for App {
+    fn scale_factor_changed(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &WlSurface,
+        _new_factor: i32,
     ) {
-        let window_attribs = Window::default_attributes();
-        let window = Arc::new(
-            event_loop
-                .create_window(window_attribs)
-                .expect("Failed to create window"),
-        );
-        self.state =
-            Some(pollster::block_on(State::new(window)).expect("Failed to initalize state"));
     }
 
-    fn user_event(
+    fn transform_changed(
         &mut self,
-        _event_loop: &ActiveEventLoop,
-        event: State,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &WlSurface,
+        _new_transform: Transform,
     ) {
-        self.state = Some(event);
     }
 
-    fn window_event(
+    fn surface_enter(
         &mut self,
-        event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
-        event: WindowEvent,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &WlSurface,
+        _output: &WlOutput,
     ) {
-        let state = match &mut self.state {
-            Some(canvas) => canvas,
-            None => return,
+    }
+
+    fn surface_leave(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &WlSurface,
+        _output: &WlOutput,
+    ) {
+    }
+
+    fn frame(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        surface: &WlSurface,
+        _time: u32,
+    ) {
+        let framebuffer = &mut self.framebuffers[0];
+        if !framebuffer.released {
+            tracing::warn!("Framebuffer not yet released!");
+            return;
+        }
+        framebuffer.released = false;
+
+        //tracing::debug!("Rendering frame!");
+        let (width, height) = framebuffer.size;
+        framebuffer
+            .gbm
+            .map_mut(0, 0, width, height, |mapped| {
+                bytemuck::cast_slice_mut(mapped.buffer_mut()).fill(self.swatch_color);
+            })
+            .expect("Failed to write to framebuffer");
+
+        let Some(buffer) = framebuffer.wayland.as_ref() else {
+            tracing::warn!("Framebuffer not yet created!");
+            return;
         };
+        surface.attach(Some(buffer), 0, 0);
+        surface.damage(0, 0, width as i32, height as i32);
+        surface.frame(qh, surface.clone());
+        surface.commit();
 
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => state.resize(size.width, size.height),
-            WindowEvent::RedrawRequested => match state.render() {
-                Ok(_) => {},
-                Err(e) => {
-                    tracing::error!("{e}");
-                    event_loop.exit();
-                },
-            },
-            _ => {},
+        self.framebuffers.swap(0, 1);
+    }
+}
+impl OutputHandler for App {
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.output_state
+    }
+
+    fn new_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: WlOutput,
+    ) {
+    }
+
+    fn output_destroyed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: WlOutput,
+    ) {
+    }
+
+    fn update_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: WlOutput,
+    ) {
+    }
+}
+impl WindowHandler for App {
+    fn request_close(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _window: &Window,
+    ) {
+        self.is_running = false;
+    }
+
+    fn configure(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _window: &Window,
+        configure: WindowConfigure,
+        _serial: u32,
+    ) {
+        tracing::debug!(?configure);
+        let (new_width, new_height) = configure.new_size;
+        let (old_width, old_height) = self.framebuffers[0].size;
+        let width = new_width.map(NonZero::get).unwrap_or(old_width);
+        let height = new_height.map(NonZero::get).unwrap_or(old_height);
+
+        for framebuffer in &mut self.framebuffers {
+            framebuffer.released = false;
+            framebuffer.size = (width, height);
+            framebuffer.wayland = None;
+
+            let buffer = self
+                .gbm_device
+                .create_buffer_object(
+                    width,
+                    height,
+                    gbm::Format::Abgr16161616f,
+                    gbm::BufferObjectFlags::LINEAR | gbm::BufferObjectFlags::SCANOUT,
+                )
+                .expect("failed to create framebuffer");
+
+            let stride = size_of::<Rgba<f16>>() as u32 * width;
+            let fd = buffer.fd().expect("failed to get framebuffer fd");
+
+            let params = self
+                .dmabuf_state
+                .create_params(&qh)
+                .expect("Failed to create dmabuf");
+            params.add(fd.as_fd(), 0, 0, stride, 0);
+            framebuffer.params = params.create(
+                width as i32,
+                height as i32,
+                0x48344241, // ABGR f16
+                zwp_linux_buffer_params_v1::Flags::empty(),
+            );
+            framebuffer.fd = fd;
+            framebuffer.gbm = buffer;
         }
     }
 }
 
+impl DmabufHandler for App {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    fn created(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        params: &ZwpLinuxBufferParamsV1,
+        buffer: WlBuffer,
+    ) {
+        tracing::debug!("New buffer created");
+        let Some(framebuffer) = self
+            .framebuffers
+            .iter_mut()
+            .find(|framebuffer| framebuffer.params == *params)
+        else {
+            return;
+        };
+        framebuffer.wayland = Some(buffer);
+        framebuffer.released = true;
+
+        if self.framebuffers[0].params == *params {
+            self.surface
+                .attach(self.framebuffers[0].wayland.as_ref(), 0, 0);
+            self.surface.commit();
+        }
+    }
+
+    fn failed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _params: &ZwpLinuxBufferParamsV1,
+    ) {
+        tracing::debug!("Failed buffer created");
+    }
+
+    fn released(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        buffer: &WlBuffer,
+    ) {
+        let Some(framebuffer) = self
+            .framebuffers
+            .iter_mut()
+            .find(|framebuffer| framebuffer.wayland.as_ref() == Some(buffer))
+        else {
+            return;
+        };
+
+        framebuffer.released = true;
+    }
+
+    fn dmabuf_feedback(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _proxy: &wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
+        _feedback: smithay_client_toolkit::dmabuf::DmabufFeedback,
+    ) {
+    }
+}
+
+impl ProvidesRegistryState for App {
+    registry_handlers![OutputState,];
+
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
+}
+
+delegate_compositor!(App);
+delegate_output!(App);
+delegate_xdg_shell!(App);
+delegate_xdg_window!(App);
+delegate_dmabuf!(App);
+delegate_registry!(App);
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let fmt_subscriber = tracing_subscriber::fmt::Subscriber::builder()
-        .with_max_level(tracing::Level::TRACE)
-        .finish();
-    tracing::subscriber::set_global_default(fmt_subscriber)?;
+    let stdout = tracing_subscriber::fmt::layer();
+    let registry = tracing_subscriber::registry().with(
+        stdout.with_filter(
+            Targets::default()
+                .with_target("colortool", Level::TRACE)
+                .with_default(Level::INFO),
+        ),
+    );
+    tracing::subscriber::set_global_default(registry)?;
+
     tracing::info!("Hello World!");
 
-    let event_loop = EventLoop::with_user_event().build()?;
-    let mut app = App::new();
-    event_loop.run_app(&mut app)?;
+    let mut event_loop = EventLoop::<App>::try_new().expect("Failed to initalize event loop");
+    let mut app = App::new(event_loop.handle())?;
+
+    app.is_running = true;
+    loop {
+        event_loop.dispatch(None, &mut app)?;
+
+        if !app.is_running {
+            break;
+        }
+    }
 
     Ok(())
 }
