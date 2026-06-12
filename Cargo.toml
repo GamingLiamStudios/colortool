@@ -8,6 +8,7 @@ smithay-client-toolkit = "0.20"
 wayland-client = "0.31"
 wayland-protocols = "0.32"
 wayland-protocols-plasma = "0.3"
+calloop = "0.14"
 
 gbm = "0.18"
 memmap2 = "0.9"

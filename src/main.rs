@@ -1,14 +1,36 @@
 use std::{
     fs::File,
+    io::{
+        Read,
+        Write,
+    },
     num::NonZero,
     os::fd::{
         AsFd,
         OwnedFd,
     },
+    process::{
+        ChildStdout,
+        Stdio,
+    },
+    time::Duration,
 };
 
+use calloop::{
+    Interest,
+    generic::Generic,
+    timer::{
+        TimeoutAction,
+        Timer,
+    },
+};
 use half::f16;
-use rgb::Rgba;
+use rgb::{
+    ColorComponentMap,
+    ComponentMap,
+    Rgb,
+    Rgba,
+};
 use smithay_client_toolkit::{
     compositor::{
         CompositorHandler,
@@ -94,6 +116,9 @@ enum Error {
     #[error("Wayland Eventloop Error")]
     WaylandInsert(#[from] InsertError<WaylandSource<App>>),
 
+    #[error("Spotread init Error")]
+    SpotreadInsert(#[from] InsertError<Generic<ChildStdout>>),
+
     #[error("I/O Error")]
     GenericIO(#[from] std::io::Error),
 }
@@ -119,8 +144,20 @@ struct App {
 
     pub is_running: bool,
     swatch_color:   rgb::Rgba<f16>,
+    swatch_updated: bool,
+
+    spotread:            std::process::Child,
+    spotread_in:         std::process::ChildStdin,
+    pub detected_swatch: Rgb<f64>, // in unnormalized XYZ
 
     loop_handle: LoopHandle<'static, Self>,
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        _ = self.spotread_in.write_all("qq".as_bytes());
+        _ = self.spotread.wait();
+    }
 }
 
 impl App {
@@ -155,6 +192,60 @@ impl App {
             .read(true)
             .open("/dev/dri/renderD128")?;
         let gbm_device = gbm::Device::new(card)?;
+
+        let mut spotread = std::process::Command::new("spotread")
+            .arg("-e")
+            .env("ARGYLL_NOT_INTERACTIVE", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+
+        let spotread_out = spotread
+            .stdout
+            .take()
+            .expect("Failed to get stdout for spotread");
+        let spotread_in = spotread
+            .stdin
+            .take()
+            .expect("Failed to get stdin for spotread");
+
+        loop_handle.insert_source(
+            Generic::new(spotread_out, Interest::READ, calloop::Mode::Edge),
+            |readiness, stdout, app| {
+                if !readiness.readable {
+                    tracing::warn!(?readiness, "Spotread callback triggered with no new output");
+                    return Ok(calloop::PostAction::Continue);
+                }
+
+                let mut buf = vec![0; 4096];
+                let bytes_read = unsafe { stdout.get_mut().read(buf.as_mut_slice()) }?;
+                buf.truncate(bytes_read);
+
+                let string = String::from_utf8(buf).expect("Non-UTF8 output from spotread");
+
+                // Process string
+                let mut results = string
+                    .lines()
+                    .map(|s| s.trim())
+                    .filter(|s| s.starts_with("Result is XYZ: "));
+                if let Some(result) = results.next() {
+                    let values: Vec<_> = result
+                        .split_whitespace()
+                        .skip(3)
+                        .take(3)
+                        .map(|s| {
+                            s.trim_end_matches(',')
+                                .parse()
+                                .expect("Returned XYZ not valid")
+                        })
+                        .collect();
+                    app.detected_swatch = Rgb::new(values[0], values[1], values[2]);
+                    tracing::debug!(detected = ?app.detected_swatch);
+                }
+
+                Ok(calloop::PostAction::Continue)
+            },
+        )?;
 
         Ok(Self {
             registry_state: RegistryState::new(&globals),
@@ -194,19 +285,32 @@ impl App {
             }),
             dmabuf_state,
             swatch_color: Rgba::new(
-                f16::from_f32(2.0),
-                f16::from_f32(2.0),
-                f16::from_f32(2.0),
+                f16::from_f32(0.0),
+                f16::from_f32(0.0),
+                f16::from_f32(0.0),
                 f16::from_f32(1.0),
             ),
+            swatch_updated: true,
+            detected_swatch: Rgb::new(-1.0, -1.0, -1.0),
 
             surface,
             window,
             gbm_device,
 
+            spotread,
+            spotread_in,
+
             loop_handle,
             is_running: false,
         })
+    }
+
+    pub fn set_swatch(
+        &mut self,
+        swatch: Rgb<f32>,
+    ) {
+        self.swatch_color = swatch.with_alpha(1.0).map(f16::from_f32);
+        self.swatch_updated = false;
     }
 }
 
@@ -280,6 +384,23 @@ impl CompositorHandler for App {
         surface.commit();
 
         self.framebuffers.swap(0, 1);
+
+        if !self.swatch_updated {
+            // Trigger new spotread
+            self.loop_handle
+                .insert_source(
+                    Timer::from_duration(Duration::from_millis(200)),
+                    |_, _, app| {
+                        app.spotread_in
+                            .write_all("\n".as_bytes())
+                            .expect("Failed to write command to spotread");
+                        TimeoutAction::Drop
+                    },
+                )
+                .expect("Failed to attach new write command to event loop");
+        }
+
+        self.swatch_updated = true;
     }
 }
 impl OutputHandler for App {
@@ -466,6 +587,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut event_loop = EventLoop::<App>::try_new().expect("Failed to initalize event loop");
     let mut app = App::new(event_loop.handle())?;
+
+    let handle = event_loop.handle();
+    handle.insert_source(
+        Timer::from_duration(Duration::from_millis(10000)),
+        |_event, _metadata, app| {
+            tracing::debug!("Trigger!");
+            app.set_swatch(Rgb::new(1.0, 0.0, 0.0));
+
+            TimeoutAction::Drop
+        },
+    )?;
 
     app.is_running = true;
     loop {
