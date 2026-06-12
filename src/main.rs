@@ -38,6 +38,7 @@ use smithay_client_toolkit::{
     },
     delegate_compositor,
     delegate_dmabuf,
+    delegate_layer,
     delegate_output,
     delegate_registry,
     delegate_xdg_shell,
@@ -65,6 +66,7 @@ use smithay_client_toolkit::{
                 registry_queue_init,
             },
         },
+        protocols_wlr::layer_shell,
     },
     registry::{
         ProvidesRegistryState,
@@ -73,6 +75,12 @@ use smithay_client_toolkit::{
     registry_handlers,
     shell::{
         WaylandSurface,
+        wlr_layer::{
+            self,
+            LayerShell,
+            LayerShellHandler,
+            LayerSurface,
+        },
         xdg::{
             XdgShell,
             window::{
@@ -139,8 +147,7 @@ struct App {
 
     gbm_device:   gbm::Device<File>,
     framebuffers: [Framebuffer; 2],
-    surface:      WlSurface,
-    window:       Window,
+    window:       LayerSurface,
 
     pub is_running: bool,
     swatch_color:   rgb::Rgba<f16>,
@@ -169,19 +176,20 @@ impl App {
         WaylandSource::new(conn.clone(), event_queue).insert(loop_handle.clone())?;
 
         let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor missing");
-        let xdg_shell = XdgShell::bind(&globals, &qh).expect("xdg_shell missing");
+        let layer_shell = LayerShell::bind(&globals, &qh).expect("layer_shell missing");
         let dmabuf_state = DmabufState::new(&globals, &qh);
 
         let surface = compositor.create_surface(&qh);
-        let window = xdg_shell.create_window(
-            surface.clone(),
-            smithay_client_toolkit::shell::xdg::window::WindowDecorations::None,
+        let window = layer_shell.create_layer_surface(
             &qh,
+            surface.clone(),
+            wlr_layer::Layer::Overlay,
+            Some("colortool"),
+            None,
         );
 
-        window.set_title("colortool");
-        window.set_app_id("org.glstudios.colortool");
-        window.set_min_size(Some((256, 256)));
+        window.set_size(256, 256);
+        window.set_keyboard_interactivity(wlr_layer::KeyboardInteractivity::None);
         window.commit();
 
         surface.frame(&qh, surface.clone());
@@ -293,7 +301,6 @@ impl App {
             swatch_updated: true,
             detected_swatch: Rgb::new(-1.0, -1.0, -1.0),
 
-            surface,
             window,
             gbm_device,
 
@@ -432,12 +439,12 @@ impl OutputHandler for App {
     ) {
     }
 }
-impl WindowHandler for App {
-    fn request_close(
+impl LayerShellHandler for App {
+    fn closed(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _window: &Window,
+        _layer: &wlr_layer::LayerSurface,
     ) {
         self.is_running = false;
     }
@@ -446,15 +453,16 @@ impl WindowHandler for App {
         &mut self,
         _conn: &Connection,
         qh: &QueueHandle<Self>,
-        _window: &Window,
-        configure: WindowConfigure,
+        layer: &wlr_layer::LayerSurface,
+        configure: wlr_layer::LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        tracing::debug!(?configure);
-        let (new_width, new_height) = configure.new_size;
+        //tracing::debug!(?configure);
+        let (width, height) = configure.new_size;
         let (old_width, old_height) = self.framebuffers[0].size;
-        let width = new_width.map(NonZero::get).unwrap_or(old_width);
-        let height = new_height.map(NonZero::get).unwrap_or(old_height);
+        if width == old_width && height == old_height {
+            return;
+        }
 
         for framebuffer in &mut self.framebuffers {
             framebuffer.released = false;
@@ -488,9 +496,11 @@ impl WindowHandler for App {
             framebuffer.fd = fd;
             framebuffer.gbm = buffer;
         }
+
+        layer.wl_surface().frame(qh, layer.wl_surface().clone());
+        layer.wl_surface().commit();
     }
 }
-
 impl DmabufHandler for App {
     fn dmabuf_state(&mut self) -> &mut DmabufState {
         &mut self.dmabuf_state
@@ -515,9 +525,10 @@ impl DmabufHandler for App {
         framebuffer.released = true;
 
         if self.framebuffers[0].params == *params {
-            self.surface
+            self.window
+                .wl_surface()
                 .attach(self.framebuffers[0].wayland.as_ref(), 0, 0);
-            self.surface.commit();
+            self.window.wl_surface().commit();
         }
     }
 
@@ -567,8 +578,7 @@ impl ProvidesRegistryState for App {
 
 delegate_compositor!(App);
 delegate_output!(App);
-delegate_xdg_shell!(App);
-delegate_xdg_window!(App);
+delegate_layer!(App);
 delegate_dmabuf!(App);
 delegate_registry!(App);
 
@@ -592,8 +602,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     handle.insert_source(
         Timer::from_duration(Duration::from_millis(10000)),
         |_event, _metadata, app| {
-            tracing::debug!("Trigger!");
-            app.set_swatch(Rgb::new(1.0, 0.0, 0.0));
+            let color = Rgb::new(1.0, 0.0, 0.0);
+            tracing::debug!(?color, "Measuring Red!");
+            app.set_swatch(color);
 
             TimeoutAction::Drop
         },
