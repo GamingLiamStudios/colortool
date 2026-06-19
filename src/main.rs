@@ -1,7 +1,10 @@
+mod wlcolor;
+
 use std::{
     fs::File,
     io::{
         Read,
+        Stdin,
         Write,
     },
     num::NonZero,
@@ -17,6 +20,8 @@ use std::{
 };
 
 use calloop::{
+    Dispatcher,
+    EventSource,
     Interest,
     generic::Generic,
     timer::{
@@ -25,6 +30,10 @@ use calloop::{
     },
 };
 use half::f16;
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+};
 use rgb::{
     ColorComponentMap,
     ComponentMap,
@@ -47,6 +56,7 @@ use smithay_client_toolkit::{
         DmabufHandler,
         DmabufState,
     },
+    globals::GlobalData,
     output::{
         OutputHandler,
         OutputState,
@@ -98,7 +108,9 @@ use tracing_subscriber::{
     layer::SubscriberExt,
 };
 use wayland_client::{
+    Dispatch,
     QueueHandle,
+    delegate_dispatch,
     protocol::{
         wl_buffer::WlBuffer,
         wl_output::{
@@ -108,9 +120,32 @@ use wayland_client::{
         wl_surface::WlSurface,
     },
 };
-use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::{
-    self,
-    ZwpLinuxBufferParamsV1,
+use wayland_protocols::wp::{
+    color_management::v1::client::{
+        wp_color_management_output_v1::{
+            self,
+            WpColorManagementOutputV1,
+        },
+        wp_color_management_surface_feedback_v1,
+        wp_color_manager_v1::{
+            self,
+            WpColorManagerV1,
+        },
+        wp_image_description_info_v1,
+        wp_image_description_v1::{
+            self,
+            WpImageDescriptionV1,
+        },
+    },
+    linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::{
+        self,
+        ZwpLinuxBufferParamsV1,
+    },
+};
+
+use crate::wlcolor::{
+    ColorHandler,
+    ColorState,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -140,14 +175,22 @@ struct Framebuffer {
     released: bool,
 }
 
+struct Output {
+    wayland:      WlOutput,
+    color_output: WpColorManagementOutputV1,
+    description:  Option<WpImageDescriptionV1>,
+}
+
 struct App {
     registry_state: RegistryState,
     output_state:   OutputState,
     dmabuf_state:   DmabufState,
+    color_state:    ColorState,
 
-    gbm_device:   gbm::Device<File>,
-    framebuffers: [Framebuffer; 2],
-    window:       LayerSurface,
+    gbm_device:    gbm::Device<File>,
+    framebuffers:  [Framebuffer; 2],
+    active_output: Option<WlOutput>,
+    window:        LayerSurface,
 
     pub is_running: bool,
     swatch_color:   rgb::Rgba<f16>,
@@ -157,27 +200,33 @@ struct App {
     spotread_in:         std::process::ChildStdin,
     pub detected_swatch: Rgb<f64>, // in unnormalized XYZ
 
+    terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
+
     loop_handle: LoopHandle<'static, Self>,
 }
 
 impl Drop for App {
     fn drop(&mut self) {
-        _ = self.spotread_in.write_all("qq".as_bytes());
+        _ = self.spotread_in.write_all(b"qq");
         _ = self.spotread.wait();
     }
 }
 
 impl App {
-    pub fn new(loop_handle: LoopHandle<'static, App>) -> Result<Self, Error> {
+    pub fn new(
+        loop_handle: LoopHandle<'static, Self>,
+        terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<Self, Error> {
         let conn = Connection::connect_to_env()?;
 
         let (globals, event_queue) = registry_queue_init(&conn)?;
         let qh = event_queue.handle();
-        WaylandSource::new(conn.clone(), event_queue).insert(loop_handle.clone())?;
+        WaylandSource::new(conn, event_queue).insert(loop_handle.clone())?;
 
         let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor missing");
         let layer_shell = LayerShell::bind(&globals, &qh).expect("layer_shell missing");
         let dmabuf_state = DmabufState::new(&globals, &qh);
+        let color_state = ColorState::bind(&globals, &qh).expect("color_management missing");
 
         let surface = compositor.create_surface(&qh);
         let window = layer_shell.create_layer_surface(
@@ -234,7 +283,7 @@ impl App {
                 // Process string
                 let mut results = string
                     .lines()
-                    .map(|s| s.trim())
+                    .map(str::trim)
                     .filter(|s| s.starts_with("Result is XYZ: "));
                 if let Some(result) = results.next() {
                     let values: Vec<_> = result
@@ -258,6 +307,7 @@ impl App {
         Ok(Self {
             registry_state: RegistryState::new(&globals),
             output_state: OutputState::new(&globals, &qh),
+            color_state,
 
             framebuffers: std::array::from_fn(|i| {
                 let buffer = gbm_device
@@ -283,9 +333,9 @@ impl App {
                     size: (256, 256),
                     wayland: None,
                     params: params.create(
-                        256 as i32,
-                        256 as i32,
-                        0x48344241, // ABGR f16
+                        256_i32,
+                        256_i32,
+                        0x4834_4241, // ABGR f16
                         zwp_linux_buffer_params_v1::Flags::empty(),
                     ),
                     released: true,
@@ -302,7 +352,9 @@ impl App {
             detected_swatch: Rgb::new(-1.0, -1.0, -1.0),
 
             window,
+            active_output: None,
             gbm_device,
+            terminal,
 
             spotread,
             spotread_in,
@@ -343,10 +395,15 @@ impl CompositorHandler for App {
     fn surface_enter(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _surface: &WlSurface,
-        _output: &WlOutput,
+        output: &WlOutput,
     ) {
+        if self.active_output.is_some() {
+            tracing::warn!("Surface entered new output while already active on another output!");
+        }
+
+        self.active_output = Some(output.clone());
     }
 
     fn surface_leave(
@@ -354,8 +411,13 @@ impl CompositorHandler for App {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _surface: &WlSurface,
-        _output: &WlOutput,
+        output: &WlOutput,
     ) {
+        if let Some(active_output) = &self.active_output
+            && active_output == output
+        {
+            self.active_output = None;
+        }
     }
 
     fn frame(
@@ -386,7 +448,7 @@ impl CompositorHandler for App {
             return;
         };
         surface.attach(Some(buffer), 0, 0);
-        surface.damage(0, 0, width as i32, height as i32);
+        surface.damage(0, 0, width.cast_signed(), height.cast_signed());
         surface.frame(qh, surface.clone());
         surface.commit();
 
@@ -397,9 +459,9 @@ impl CompositorHandler for App {
             self.loop_handle
                 .insert_source(
                     Timer::from_duration(Duration::from_millis(200)),
-                    |_, _, app| {
+                    |_, (), app| {
                         app.spotread_in
-                            .write_all("\n".as_bytes())
+                            .write_all(b"\n")
                             .expect("Failed to write command to spotread");
                         TimeoutAction::Drop
                     },
@@ -418,17 +480,19 @@ impl OutputHandler for App {
     fn new_output(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _output: WlOutput,
+        qh: &QueueHandle<Self>,
+        output: WlOutput,
     ) {
+        self.color_state.track_output(qh, output);
     }
 
     fn output_destroyed(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _output: WlOutput,
+        output: WlOutput,
     ) {
+        self.color_state.release_output(&output);
     }
 
     fn update_output(
@@ -484,13 +548,13 @@ impl LayerShellHandler for App {
 
             let params = self
                 .dmabuf_state
-                .create_params(&qh)
+                .create_params(qh)
                 .expect("Failed to create dmabuf");
             params.add(fd.as_fd(), 0, 0, stride, 0);
             framebuffer.params = params.create(
-                width as i32,
-                height as i32,
-                0x48344241, // ABGR f16
+                width.cast_signed(),
+                height.cast_signed(),
+                0x4834_4241, // ABGR f16
                 zwp_linux_buffer_params_v1::Flags::empty(),
             );
             framebuffer.fd = fd;
@@ -568,6 +632,40 @@ impl DmabufHandler for App {
     }
 }
 
+impl ColorHandler for App {
+    fn color_handler(&mut self) -> &mut wlcolor::ColorState {
+        &mut self.color_state
+    }
+
+    fn compositor_features(
+        &mut self,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+    }
+
+    fn output_update(
+        &mut self,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+        output: &WlOutput,
+        description: wlcolor::ImageDescriptionInfo,
+    ) {
+        tracing::debug!(?description, "Output color description updated");
+    }
+
+    fn surface_update(
+        &mut self,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+        proxy: &wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1,
+        surface: &WlSurface,
+        identity: u64,
+    ) {
+        todo!()
+    }
+}
+
 impl ProvidesRegistryState for App {
     registry_handlers![OutputState,];
 
@@ -582,8 +680,18 @@ delegate_layer!(App);
 delegate_dmabuf!(App);
 delegate_registry!(App);
 
+delegate_dispatch!(App: [wp_color_manager_v1::WpColorManagerV1: GlobalData] => wlcolor::ColorState);
+delegate_dispatch!(App: [wp_color_management_output_v1::WpColorManagementOutputV1: wlcolor::OutputFeedbackData] => wlcolor::ColorState);
+delegate_dispatch!(App: [wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1: wlcolor::SurfaceFeedbackData] => wlcolor::ColorState);
+
+delegate_dispatch!(App: [wp_image_description_v1::WpImageDescriptionV1: wlcolor::ImageDescriptionData] => wlcolor::ColorState);
+delegate_dispatch!(App: [wp_image_description_info_v1::WpImageDescriptionInfoV1: wlcolor::ImageDescriptionData] => wlcolor::ColorState);
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let stdout = tracing_subscriber::fmt::layer();
+    let logfile = File::create("colortool.log")?;
+    let stdout = tracing_subscriber::fmt::Layer::default()
+        .with_writer(logfile)
+        .with_ansi(false);
     let registry = tracing_subscriber::registry().with(
         stdout.with_filter(
             Targets::default()
@@ -595,18 +703,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Hello World!");
 
+    let terminal = ratatui::init();
+
+    let old_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ratatui::restore();
+        old_hook(info);
+    }));
+
     let mut event_loop = EventLoop::<App>::try_new().expect("Failed to initalize event loop");
-    let mut app = App::new(event_loop.handle())?;
+    let mut app = App::new(event_loop.handle(), terminal)?;
 
     let handle = event_loop.handle();
+    //handle.insert_source(
+    //    Timer::from_duration(Duration::from_millis(10000)),
+    //    |_event, _metadata, app| {
+    //        let color = Rgb::new(1.0, 0.0, 0.0);
+    //        tracing::debug!(?color, "Measuring Red!");
+    //        app.set_swatch(color);
+    //
+    //        TimeoutAction::Drop
+    //    },
+    //)?;
     handle.insert_source(
-        Timer::from_duration(Duration::from_millis(10000)),
-        |_event, _metadata, app| {
-            let color = Rgb::new(1.0, 0.0, 0.0);
-            tracing::debug!(?color, "Measuring Red!");
-            app.set_swatch(color);
+        Generic::new(std::io::stdin(), Interest::READ, calloop::Mode::Level),
+        |event, stdin, app| {
+            use crossterm::event::{
+                self,
+                Event,
+            };
 
-            TimeoutAction::Drop
+            // TODO: handle crossterm read
+            if !event.readable {
+                tracing::warn!(?event, "Stdin callback triggered with no new input");
+                return Ok(calloop::PostAction::Continue);
+            }
+            if !event::poll(Duration::from_secs(0))? {
+                return Ok(calloop::PostAction::Continue);
+            }
+
+            let event = event::read()?;
+            match event {
+                Event::Resize(width, height) => {
+                    tracing::debug!(?width, ?height, "Terminal resized!");
+                },
+                Event::Key(key) => {
+                    tracing::debug!(?key, "Key event!");
+                    if key.code == crossterm::event::KeyCode::Char('q') {
+                        app.is_running = false;
+                    }
+                },
+                Event::Mouse(mouse) => {
+                    tracing::debug!(?mouse, "Mouse event!");
+                },
+                _ => {},
+            }
+
+            Ok(calloop::PostAction::Continue)
         },
     )?;
 
@@ -618,6 +771,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
     }
+    ratatui::restore();
 
     Ok(())
 }
