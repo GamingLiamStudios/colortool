@@ -7,14 +7,13 @@ use std::{
     },
 };
 
-use smithay_client_toolkit::{
-    error::GlobalError,
-    globals::GlobalData,
-};
+use smithay_client_toolkit::globals::GlobalData;
 use wayland_client::{
     Connection,
     Dispatch,
+    Proxy,
     QueueHandle,
+    QueueProxyData,
     WEnum,
     globals::{
         BindError,
@@ -34,7 +33,9 @@ pub use wayland_protocols::wp::color_management::v1::client::wp_color_manager_v1
 use wayland_protocols::wp::color_management::v1::client::{
     wp_color_management_output_v1,
     wp_color_management_surface_feedback_v1,
+    wp_color_management_surface_v1,
     wp_color_manager_v1,
+    wp_image_description_creator_params_v1,
     wp_image_description_info_v1,
     wp_image_description_v1,
 };
@@ -43,6 +44,7 @@ use wayland_protocols::wp::color_management::v1::client::{
 pub struct ColorState {
     color_manager: wp_color_manager_v1::WpColorManagerV1,
     outputs:       HashMap<WlOutput, ColorOutput>,
+    surfaces:      HashMap<WlSurface, ColorSurface>,
 
     supported_idents:    Vec<WEnum<RenderIntent>>,
     supported_features:  Vec<WEnum<Feature>>,
@@ -52,7 +54,17 @@ pub struct ColorState {
 
 #[derive(Debug)]
 struct ColorOutput {
-    manager:      wp_color_management_output_v1::WpColorManagementOutputV1,
+    manager: wp_color_management_output_v1::WpColorManagementOutputV1,
+
+    info:         wp_image_description_v1::WpImageDescriptionV1,
+    pending_info: Option<wp_image_description_v1::WpImageDescriptionV1>,
+}
+
+#[derive(Debug, Clone)]
+struct ColorSurface {
+    feedback: Option<wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1>,
+    manager:  wp_color_management_surface_v1::WpColorManagementSurfaceV1,
+
     info:         wp_image_description_v1::WpImageDescriptionV1,
     pending_info: Option<wp_image_description_v1::WpImageDescriptionV1>,
 }
@@ -134,7 +146,10 @@ pub enum ImageDescriptionSource {
 
 #[derive(Debug)]
 pub enum ImageDescriptionInner {
-    NotReady(ImageDescriptionSource),
+    NotReady {
+        source: ImageDescriptionSource,
+        info:   Option<(ImageDescriptionInfo, RenderIntent)>,
+    },
     Building {
         builder: Arc<Mutex<ImageDescriptionBuilder>>,
         source:  ImageDescriptionSource,
@@ -157,6 +172,7 @@ pub trait ColorHandler: Sized {
         &mut self,
         conn: &Connection,
         qh: &QueueHandle<Self>,
+        proxy: &wp_image_description_v1::WpImageDescriptionV1,
         output: &WlOutput,
         description: ImageDescriptionInfo,
     );
@@ -166,9 +182,9 @@ pub trait ColorHandler: Sized {
         &mut self,
         conn: &Connection,
         qh: &QueueHandle<Self>,
-        proxy: &wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1,
+        proxy: &wp_image_description_v1::WpImageDescriptionV1,
         surface: &WlSurface,
-        identity: u64,
+        description: ImageDescriptionInfo,
     );
 }
 
@@ -195,6 +211,7 @@ impl ColorState {
         Ok(Self {
             color_manager,
             outputs: HashMap::new(),
+            surfaces: HashMap::new(),
 
             supported_idents: Vec::new(),
             supported_features: Vec::new(),
@@ -219,9 +236,10 @@ impl ColorState {
             });
         let info = manager.get_image_description(
             qh,
-            ImageDescriptionData(Arc::new(Mutex::new(ImageDescriptionInner::NotReady(
-                ImageDescriptionSource::Output(output.clone()),
-            )))),
+            ImageDescriptionData(Arc::new(Mutex::new(ImageDescriptionInner::NotReady {
+                source: ImageDescriptionSource::Output(output.clone()),
+                info:   None,
+            }))),
         );
 
         self.outputs.insert(output, ColorOutput {
@@ -231,6 +249,172 @@ impl ColorState {
         });
     }
 
+    pub fn set_surface_description_proxy<D>(
+        &mut self,
+        qh: &QueueHandle<D>,
+        surface: &WlSurface,
+        description: &wp_image_description_v1::WpImageDescriptionV1,
+        render_intent: RenderIntent,
+    ) where
+        D: Dispatch<
+                wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1,
+                GlobalData,
+            > + Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionData>
+            + Dispatch<wp_color_management_surface_v1::WpColorManagementSurfaceV1, GlobalData>
+            + 'static,
+    {
+        // Ensure surface is managed
+        let entry = self
+            .surfaces
+            .entry(surface.clone())
+            .or_insert_with(|| ColorSurface {
+                feedback:     None,
+                manager:      self.color_manager.get_surface(surface, qh, GlobalData),
+                info:         description.clone(),
+                pending_info: None,
+            });
+        entry.info = description.clone();
+        entry
+            .manager
+            .set_image_description(description, render_intent);
+        surface.commit();
+    }
+
+    pub fn set_surface_description<D>(
+        &mut self,
+        qh: &QueueHandle<D>,
+        surface: &WlSurface,
+        description: ImageDescriptionInfo,
+        render_intent: RenderIntent,
+    ) where
+        D: Dispatch<
+                wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1,
+                GlobalData,
+            > + Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionData>
+            + Dispatch<wp_color_management_surface_v1::WpColorManagementSurfaceV1, GlobalData>
+            + 'static,
+    {
+        // Create image description
+        let image = match &description {
+            ImageDescriptionInfo::Parametric {
+                primaries,
+                eotf,
+                luma_range,
+                ref_luma,
+                mastering_primaries,
+                mastering_luma_range,
+                target_max_cll,
+                target_max_fall,
+            } => {
+                let creator = self.color_manager.create_parametric_creator(qh, GlobalData);
+
+                match primaries {
+                    Primaries::Named(named) => {
+                        creator.set_primaries_named(
+                            named.into_result().expect(
+                                "Unknown named primary supplied to set_surface_description",
+                            ),
+                        );
+                    },
+                    Primaries::Custom {
+                        red,
+                        green,
+                        blue,
+                        white,
+                    } => {
+                        creator.set_primaries(
+                            (red.0 * 1_000_000.0) as i32,
+                            (red.1 * 1_000_000.0) as i32,
+                            (green.0 * 1_000_000.0) as i32,
+                            (green.1 * 1_000_000.0) as i32,
+                            (blue.0 * 1_000_000.0) as i32,
+                            (blue.1 * 1_000_000.0) as i32,
+                            (white.0 * 1_000_000.0) as i32,
+                            (white.1 * 1_000_000.0) as i32,
+                        );
+                    },
+                }
+
+                match eotf {
+                    Eotf::Named(named) => {
+                        creator.set_tf_named(named.into_result().expect(
+                            "Unknown named transfer function supplied to set_surface_description",
+                        ));
+                    },
+                    Eotf::Power(power) => {
+                        creator.set_tf_power((power * 10_000.0) as u32);
+                    },
+                }
+
+                creator.set_luminances(
+                    (*luma_range.start() * 10_000.0) as u32,
+                    *luma_range.end() as u32,
+                    *ref_luma as u32,
+                );
+
+                if let Some(mastering_primaries) = mastering_primaries {
+                    match mastering_primaries {
+                        Primaries::Named(_) => {
+                            // TODO: Convert named primaries to custom primaries
+                            todo!(
+                                "Named mastering primaries are not supported in set_surface_description"
+                            );
+                        },
+                        Primaries::Custom {
+                            red,
+                            green,
+                            blue,
+                            white,
+                        } => {
+                            creator.set_mastering_display_primaries(
+                                (red.0 * 1_000_000.0) as i32,
+                                (red.1 * 1_000_000.0) as i32,
+                                (green.0 * 1_000_000.0) as i32,
+                                (green.1 * 1_000_000.0) as i32,
+                                (blue.0 * 1_000_000.0) as i32,
+                                (blue.1 * 1_000_000.0) as i32,
+                                (white.0 * 1_000_000.0) as i32,
+                                (white.1 * 1_000_000.0) as i32,
+                            );
+                        },
+                    }
+                }
+                if let Some(mastering_luma_range) = mastering_luma_range {
+                    creator.set_mastering_luminance(
+                        (*mastering_luma_range.start() * 10_000.0) as u32,
+                        *mastering_luma_range.end() as u32,
+                    );
+                }
+                if let Some(target_max_cll) = target_max_cll {
+                    creator.set_max_cll((target_max_cll * 10_000.0) as u32);
+                }
+                if let Some(target_max_fall) = target_max_fall {
+                    creator.set_max_fall((target_max_fall * 10_000.0) as u32);
+                }
+
+                creator.create(
+                    qh,
+                    ImageDescriptionData(Arc::new(Mutex::new(ImageDescriptionInner::NotReady {
+                        source: ImageDescriptionSource::Surface(surface.clone()),
+                        info:   Some((description, render_intent)),
+                    }))),
+                )
+            },
+        };
+
+        // Ensure surface is managed
+        let entry = self
+            .surfaces
+            .entry(surface.clone())
+            .or_insert_with(|| ColorSurface {
+                feedback:     None,
+                manager:      self.color_manager.get_surface(surface, qh, GlobalData),
+                info:         image.clone(),
+                pending_info: None,
+            });
+        entry.info = image;
+    }
+
     pub fn release_output(
         &mut self,
         output: &WlOutput,
@@ -238,25 +422,123 @@ impl ColorState {
         self.outputs.remove(output);
     }
 
-    pub fn get_surface_feedback<D>(
-        &self,
+    pub fn release_surface(
+        &mut self,
         surface: &WlSurface,
+    ) {
+        self.surfaces.remove(surface);
+    }
+
+    pub fn track_surface<D>(
+        &mut self,
         qh: &QueueHandle<D>,
-    ) -> Result<
-        wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1,
-        GlobalError,
-    >
-    where
+        surface: &WlSurface,
+    ) where
         D: Dispatch<
                 wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1,
                 SurfaceFeedbackData,
-            > + 'static,
+            > + Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionData>
+            + Dispatch<wp_color_management_surface_v1::WpColorManagementSurfaceV1, GlobalData>
+            + 'static,
     {
-        Ok(self
-            .color_manager
-            .get_surface_feedback(surface, qh, SurfaceFeedbackData {
-                surface: surface.clone(),
-            }))
+        self.surfaces
+            .entry(surface.clone())
+            .and_modify(|info| {
+                let feedback =
+                    self.color_manager
+                        .get_surface_feedback(surface, qh, SurfaceFeedbackData {
+                            surface: surface.clone(),
+                        });
+                info.pending_info = Some(feedback.get_preferred_parametric(
+                    qh,
+                    ImageDescriptionData(Arc::new(Mutex::new(ImageDescriptionInner::NotReady {
+                        source: ImageDescriptionSource::Surface(surface.clone()),
+                        info:   None,
+                    }))),
+                ));
+                info.feedback = Some(feedback);
+            })
+            .or_insert_with(|| {
+                let manager = self.color_manager.get_surface(surface, qh, GlobalData);
+
+                let feedback =
+                    self.color_manager
+                        .get_surface_feedback(surface, qh, SurfaceFeedbackData {
+                            surface: surface.clone(),
+                        });
+                let info = feedback.get_preferred_parametric(
+                    qh,
+                    ImageDescriptionData(Arc::new(Mutex::new(ImageDescriptionInner::NotReady {
+                        source: ImageDescriptionSource::Surface(surface.clone()),
+                        info:   None,
+                    }))),
+                );
+
+                ColorSurface {
+                    feedback: Some(feedback),
+                    manager,
+                    info: info.clone(),
+                    pending_info: Some(info),
+                }
+            });
+    }
+
+    pub fn get_surface_description(
+        &self,
+        surface: &WlSurface,
+    ) -> Option<ImageDescriptionInfo> {
+        self.surfaces.get(surface).map(|info| {
+            let data: &ImageDescriptionData = info.info.data().unwrap();
+            let guard = data.0.lock().unwrap();
+            match &*guard {
+                ImageDescriptionInner::Defined(info) => info.clone(),
+                _ => panic!("Surface description is not ready"),
+            }
+        })
+    }
+}
+
+impl<D>
+    Dispatch<
+        wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1,
+        GlobalData,
+        D,
+    > for ColorState
+where
+    D: Dispatch<
+            wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1,
+            GlobalData,
+        > + ColorHandler
+        + 'static,
+{
+    fn event(
+        _state: &mut D,
+        _proxy: &wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1,
+        _event: wp_image_description_creator_params_v1::Event,
+        _data: &GlobalData,
+        _conn: &Connection,
+        _qh: &QueueHandle<D>,
+    ) {
+        // No events for type
+    }
+}
+
+impl<D> Dispatch<wp_color_management_surface_v1::WpColorManagementSurfaceV1, GlobalData, D>
+    for ColorState
+where
+    D: Dispatch<wp_color_management_surface_v1::WpColorManagementSurfaceV1, GlobalData>
+        + ColorHandler
+        + 'static,
+{
+    fn event(
+        _state: &mut D,
+        _proxy: &wp_color_management_surface_v1::WpColorManagementSurfaceV1,
+        _event: wp_color_management_surface_v1::Event,
+        _data: &GlobalData,
+        _conn: &Connection,
+        _qh: &QueueHandle<D>,
+    ) {
+        // No events for type
     }
 }
 
@@ -277,7 +559,7 @@ where
         qh: &QueueHandle<D>,
     ) {
         match event {
-            wp_color_management_output_v1::Event::ImageDescriptionChanged {} => {
+            wp_color_management_output_v1::Event::ImageDescriptionChanged => {
                 let output = state
                     .color_handler()
                     .outputs
@@ -286,9 +568,10 @@ where
 
                 let new_info = output.manager.get_image_description(
                     qh,
-                    ImageDescriptionData(Arc::new(Mutex::new(ImageDescriptionInner::NotReady(
-                        ImageDescriptionSource::Output(data.output.clone()),
-                    )))),
+                    ImageDescriptionData(Arc::new(Mutex::new(ImageDescriptionInner::NotReady {
+                        source: ImageDescriptionSource::Output(data.output.clone()),
+                        info:   None,
+                    }))),
                 );
                 output.pending_info = Some(new_info);
             },
@@ -307,26 +590,38 @@ where
     D: Dispatch<
             wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1,
             SurfaceFeedbackData,
-        > + ColorHandler,
+        > + Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionData>
+        + ColorHandler
+        + 'static,
 {
     fn event(
         state: &mut D,
-        proxy: &wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1,
+        _proxy: &wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1,
         event: wp_color_management_surface_feedback_v1::Event,
         data: &SurfaceFeedbackData,
-        conn: &Connection,
+        _conn: &Connection,
         qh: &QueueHandle<D>,
     ) {
         match event {
-            wp_color_management_surface_feedback_v1::Event::PreferredChanged2 {
-                identity_hi,
-                identity_lo,
+            wp_color_management_surface_feedback_v1::Event::PreferredChanged { identity: _ }
+            | wp_color_management_surface_feedback_v1::Event::PreferredChanged2 {
+                identity_hi: _,
+                identity_lo: _,
             } => {
-                let identity = (identity_hi as u64) << 32 | (identity_lo as u64);
-                state.surface_update(conn, qh, proxy, &data.surface, identity);
-            },
-            wp_color_management_surface_feedback_v1::Event::PreferredChanged { identity } => {
-                state.surface_update(conn, qh, proxy, &data.surface, identity as u64);
+                let surface = state
+                    .color_handler()
+                    .surfaces
+                    .get_mut(&data.surface)
+                    .expect("Got event on untracked surface");
+
+                let new_info = surface.feedback.as_ref().unwrap().get_preferred_parametric(
+                    qh,
+                    ImageDescriptionData(Arc::new(Mutex::new(ImageDescriptionInner::NotReady {
+                        source: ImageDescriptionSource::Surface(data.surface.clone()),
+                        info:   None,
+                    }))),
+                );
+                surface.pending_info = Some(new_info);
             },
             _ => unreachable!(),
         }
@@ -342,7 +637,7 @@ where
         + 'static,
 {
     fn event(
-        _state: &mut D,
+        state: &mut D,
         proxy: &wp_image_description_v1::WpImageDescriptionV1,
         event: wp_image_description_v1::Event,
         data: &ImageDescriptionData,
@@ -355,30 +650,46 @@ where
             wp_image_description_v1::Event::Failed { cause: _, msg: _ } => {
                 todo!()
             },
-            wp_image_description_v1::Event::Ready { identity: _ } => {
-                let ImageDescriptionInner::NotReady(ref source) = *guard else {
-                    return;
-                };
-                let builder = Arc::new(Mutex::new(ImageDescriptionBuilder::default()));
-                *guard = ImageDescriptionInner::Building {
-                    builder,
-                    source: source.clone(),
-                };
-                _ = proxy.get_information(qh, data.clone());
-            },
-            wp_image_description_v1::Event::Ready2 {
+            wp_image_description_v1::Event::Ready { identity: _ }
+            | wp_image_description_v1::Event::Ready2 {
                 identity_hi: _,
                 identity_lo: _,
             } => {
-                let ImageDescriptionInner::NotReady(ref source) = *guard else {
+                let ImageDescriptionInner::NotReady {
+                    ref source,
+                    ref info,
+                } = *guard
+                else {
                     return;
                 };
-                let builder = Arc::new(Mutex::new(ImageDescriptionBuilder::default()));
-                *guard = ImageDescriptionInner::Building {
-                    builder,
-                    source: source.clone(),
-                };
-                _ = proxy.get_information(qh, data.clone());
+                let source = source.clone();
+
+                if let Some((info, intent)) = info.clone() {
+                    // If we already have information about the image, its probably from a
+                    // set_surface_description call.
+                    *guard = ImageDescriptionInner::Defined(info);
+                    let ImageDescriptionSource::Surface(surface) = source else {
+                        return;
+                    };
+                    state
+                        .color_handler()
+                        .surfaces
+                        .get(&surface)
+                        .expect("Surface doesn't exist")
+                        .manager
+                        .set_image_description(proxy, intent);
+                    surface.commit();
+                } else {
+                    // If we don't have any information about the image yet, its probably a
+                    // requested image.
+                    let builder = Arc::new(Mutex::new(ImageDescriptionBuilder::default()));
+                    *guard = ImageDescriptionInner::Building {
+                        builder,
+                        source: source.clone(),
+                    };
+                    _ = proxy.get_information(qh, data.clone());
+                    tracing::debug!("Requested image description information for {:?}", source);
+                }
             },
             _ => unreachable!(),
         }
@@ -409,7 +720,8 @@ where
                 icc: _,
                 icc_size: _,
             } => {
-                todo!()
+                tracing::info!("Received ICC profile, but ICC profiles are not yet supported");
+                //todo!()
             },
             Event::Done => {
                 let ImageDescriptionInner::Building { builder, source } = &*guard else {
@@ -421,10 +733,31 @@ where
 
                 match source {
                     ImageDescriptionSource::Output(output) => {
-                        state.output_update(conn, qh, &output, description);
+                        let proxy =
+                            if let Some(info) = state.color_handler().outputs.get_mut(&output) {
+                                info.info = info
+                                    .pending_info
+                                    .take()
+                                    .expect("Output info should be pending");
+                                info.info.clone()
+                            } else {
+                                return;
+                            };
+
+                        state.output_update(conn, qh, &proxy, &output, description);
                     },
-                    ImageDescriptionSource::Surface(_) => {
-                        todo!()
+                    ImageDescriptionSource::Surface(surface) => {
+                        let proxy =
+                            if let Some(info) = state.color_handler().surfaces.get_mut(&surface) {
+                                info.info = info
+                                    .pending_info
+                                    .take()
+                                    .expect("Surface info should be pending");
+                                info.info.clone()
+                            } else {
+                                return;
+                            };
+                        state.surface_update(conn, qh, &proxy, &surface, description);
                     },
                 }
             },

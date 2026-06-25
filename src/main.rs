@@ -127,10 +127,12 @@ use wayland_protocols::wp::{
             WpColorManagementOutputV1,
         },
         wp_color_management_surface_feedback_v1,
+        wp_color_management_surface_v1,
         wp_color_manager_v1::{
             self,
             WpColorManagerV1,
         },
+        wp_image_description_creator_params_v1,
         wp_image_description_info_v1,
         wp_image_description_v1::{
             self,
@@ -175,10 +177,9 @@ struct Framebuffer {
     released: bool,
 }
 
-struct Output {
-    wayland:      WlOutput,
-    color_output: WpColorManagementOutputV1,
-    description:  Option<WpImageDescriptionV1>,
+struct SpotreadPipe {
+    process: std::process::Child,
+    stdin:   std::process::ChildStdin,
 }
 
 struct App {
@@ -196,8 +197,7 @@ struct App {
     swatch_color:   rgb::Rgba<f16>,
     swatch_updated: bool,
 
-    spotread:            std::process::Child,
-    spotread_in:         std::process::ChildStdin,
+    spotread:            SpotreadPipe,
     pub detected_swatch: Rgb<f64>, // in unnormalized XYZ
 
     terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
@@ -207,8 +207,8 @@ struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        _ = self.spotread_in.write_all(b"qq");
-        _ = self.spotread.wait();
+        _ = self.spotread.stdin.write_all(b"qq");
+        _ = self.spotread.process.wait();
     }
 }
 
@@ -226,7 +226,7 @@ impl App {
         let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor missing");
         let layer_shell = LayerShell::bind(&globals, &qh).expect("layer_shell missing");
         let dmabuf_state = DmabufState::new(&globals, &qh);
-        let color_state = ColorState::bind(&globals, &qh).expect("color_management missing");
+        let mut color_state = ColorState::bind(&globals, &qh).expect("color_management missing");
 
         let surface = compositor.create_surface(&qh);
         let window = layer_shell.create_layer_surface(
@@ -244,24 +244,27 @@ impl App {
         surface.frame(&qh, surface.clone());
         surface.commit();
 
+        color_state.track_surface(&qh, &surface);
+
         let card = File::options()
             .write(true)
             .read(true)
             .open("/dev/dri/renderD128")?;
         let gbm_device = gbm::Device::new(card)?;
 
-        let mut spotread = std::process::Command::new("spotread")
+        let mut spotread_process = std::process::Command::new("spotread")
             .arg("-e")
             .env("ARGYLL_NOT_INTERACTIVE", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()?;
 
-        let spotread_out = spotread
+        let spotread_out = spotread_process
             .stdout
             .take()
             .expect("Failed to get stdout for spotread");
-        let spotread_in = spotread
+        let spotread_stdin = spotread_process
             .stdin
             .take()
             .expect("Failed to get stdin for spotread");
@@ -356,8 +359,10 @@ impl App {
             gbm_device,
             terminal,
 
-            spotread,
-            spotread_in,
+            spotread: SpotreadPipe {
+                process: spotread_process,
+                stdin:   spotread_stdin,
+            },
 
             loop_handle,
             is_running: false,
@@ -395,7 +400,7 @@ impl CompositorHandler for App {
     fn surface_enter(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
         _surface: &WlSurface,
         output: &WlOutput,
     ) {
@@ -460,9 +465,7 @@ impl CompositorHandler for App {
                 .insert_source(
                     Timer::from_duration(Duration::from_millis(200)),
                     |_, (), app| {
-                        app.spotread_in
-                            .write_all(b"\n")
-                            .expect("Failed to write command to spotread");
+                        _ = app.spotread.stdin.write_all(b"\n");
                         TimeoutAction::Drop
                     },
                 )
@@ -480,19 +483,19 @@ impl OutputHandler for App {
     fn new_output(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
-        output: WlOutput,
+        _qh: &QueueHandle<Self>,
+        _output: WlOutput,
     ) {
-        self.color_state.track_output(qh, output);
+        //self.color_state.track_output(qh, output);
     }
 
     fn output_destroyed(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        output: WlOutput,
+        _output: WlOutput,
     ) {
-        self.color_state.release_output(&output);
+        //self.color_state.release_output(&output);
     }
 
     fn update_output(
@@ -648,6 +651,7 @@ impl ColorHandler for App {
         &mut self,
         conn: &Connection,
         qh: &QueueHandle<Self>,
+        proxy: &wp_image_description_v1::WpImageDescriptionV1,
         output: &WlOutput,
         description: wlcolor::ImageDescriptionInfo,
     ) {
@@ -656,13 +660,19 @@ impl ColorHandler for App {
 
     fn surface_update(
         &mut self,
-        conn: &Connection,
+        _conn: &Connection,
         qh: &QueueHandle<Self>,
-        proxy: &wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1,
+        proxy: &wp_image_description_v1::WpImageDescriptionV1,
         surface: &WlSurface,
-        identity: u64,
+        description: wlcolor::ImageDescriptionInfo,
     ) {
-        todo!()
+        tracing::debug!(?description, "Surface color description updated");
+        self.color_state.set_surface_description_proxy(
+            qh,
+            surface,
+            proxy,
+            wp_color_manager_v1::RenderIntent::Perceptual,
+        );
     }
 }
 
@@ -682,10 +692,12 @@ delegate_registry!(App);
 
 delegate_dispatch!(App: [wp_color_manager_v1::WpColorManagerV1: GlobalData] => wlcolor::ColorState);
 delegate_dispatch!(App: [wp_color_management_output_v1::WpColorManagementOutputV1: wlcolor::OutputFeedbackData] => wlcolor::ColorState);
+delegate_dispatch!(App: [wp_color_management_surface_v1::WpColorManagementSurfaceV1: GlobalData] => wlcolor::ColorState);
 delegate_dispatch!(App: [wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1: wlcolor::SurfaceFeedbackData] => wlcolor::ColorState);
 
 delegate_dispatch!(App: [wp_image_description_v1::WpImageDescriptionV1: wlcolor::ImageDescriptionData] => wlcolor::ColorState);
 delegate_dispatch!(App: [wp_image_description_info_v1::WpImageDescriptionInfoV1: wlcolor::ImageDescriptionData] => wlcolor::ColorState);
+delegate_dispatch!(App: [wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1: GlobalData] => wlcolor::ColorState);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let logfile = File::create("colortool.log")?;
@@ -715,16 +727,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(event_loop.handle(), terminal)?;
 
     let handle = event_loop.handle();
-    //handle.insert_source(
-    //    Timer::from_duration(Duration::from_millis(10000)),
-    //    |_event, _metadata, app| {
-    //        let color = Rgb::new(1.0, 0.0, 0.0);
-    //        tracing::debug!(?color, "Measuring Red!");
-    //        app.set_swatch(color);
-    //
-    //        TimeoutAction::Drop
-    //    },
-    //)?;
+    handle.insert_source(
+        Timer::from_duration(Duration::from_millis(10000)),
+        |_event, _metadata, app| {
+            let color = Rgb::new(1.0, 0.0, 0.0);
+            tracing::debug!(?color, "Measuring Red!");
+            app.set_swatch(color);
+
+            TimeoutAction::Drop
+        },
+    )?;
     handle.insert_source(
         Generic::new(std::io::stdin(), Interest::READ, calloop::Mode::Level),
         |event, stdin, app| {
